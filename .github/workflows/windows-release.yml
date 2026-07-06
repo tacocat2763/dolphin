@@ -1,161 +1,176 @@
-# Build + package Dolphin on Windows x64 and create a release.
-# - Installs vcpkg and selected ports
-# - Configures CMake with vcpkg toolchain
-# - Builds Release, packages output into a zip
-# - Creates a GitHub release & uploads the zip
+# Windows build + release workflow for tacocat2763/dolphin
+# - Builds Dolphin on Windows x64 using CMake + vcpkg
+# - Avoids the PowerShell/vcpkg package-splitting bug by installing packages one-by-one
+# - Uses vcpkg toolchain file when configuring CMake
+# - Creates a GitHub release and uploads the produced ZIP artifact
+# Trigger: push to master, push tags, or manual workflow_dispatch
 on:
   push:
-    branches:
-      - master
+    branches: [ "master" ]
+    tags:
+      - "release-*"
   workflow_dispatch: {}
 
+concurrency:
+  group: dolphin-windows-release
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  VCPKG_TRIPLET: x64-windows
+  # Release tag uses master pushes or manual run id if not master
+  RELEASE_TAG: ${{ github.ref == 'refs/heads/master' && format('release-{0}', github.sha) || format('manual-{0}', github.run_id) }}
+
 jobs:
-  build_windows:
+  build-and-release-windows:
     name: Build and package (Windows x64)
     runs-on: windows-2025-vs2026
-
-    env:
-      BUILD_TYPE: Release
-      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+    # If that runner label is not available in your organization, change to:
+    # runs-on: windows-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: write
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 1
+      - name: Checkout repository (including submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
 
-    - name: List the two edited files (sanity)
-      shell: pwsh
-      run: |
-        $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
-        if (Test-Path $p) {
-          Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-        } else {
-          Write-Host "Directory not found: $p"
-        }
-        Write-Host "Ensure your two edited files are committed; the workflow builds whatever is checked in."
+      - name: Show edited files (DualShockUDPClient) for visibility
+        run: |
+          $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
+          if (Test-Path $p) {
+            Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+          } else {
+            Write-Host "Directory not found: $p"
+          }
 
-    - name: Clone and bootstrap vcpkg
-      shell: pwsh
-      run: |
-        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-        .\vcpkg\bootstrap-vcpkg.bat
-        .\vcpkg\vcpkg integrate install
-        Write-Host "vcpkg root: $PWD\vcpkg"
-        Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
+      - name: Clone vcpkg and bootstrap
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          & .\vcpkg\bootstrap-vcpkg.bat
+          # Expose VCPKG_ROOT for later steps
+          Write-Host "vcpkg root: $PWD\vcpkg"
+          Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
-    - name: Install vcpkg ports (explicit args — avoids PowerShell single-arg bug)
-      shell: pwsh
-      run: |
-        # IMPORTANT: pass packages as separate argv items so vcpkg parses them individually
-        .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
+      - name: Install vcpkg packages (safe split per-package)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+        run: |
+          # Install the (explicit) packages required by Dolphin in x64-windows triplet.
+          # Installing packages one-by-one avoids PowerShell passing the entire space-separated
+          # string as a single vcpkg package spec (the error you hit).
+          $packages = @(
+            'fmt',
+            'sqlite3',
+            'zlib',
+            'libpng',
+            'libjpeg-turbo',
+            'glew'
+          )
+          foreach ($p in $packages) {
+            Write-Host "Installing vcpkg package: $p"
+            & .\vcpkg\vcpkg.exe install --triplet $env:VCPKG_TRIPLET $p
+          }
 
-    - name: Show vcpkg list (diagnostic)
-      shell: pwsh
-      run: .\vcpkg\vcpkg.exe list
+      - name: Configure CMake (generate)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+        run: |
+          $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          # Use an explicit generator and architecture (Visual Studio generator + x64)
+          # and point CMake at the vcpkg toolchain file so dependencies are found.
+          cmake -S Source -B build \
+            -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" \
+            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DDOLPHIN_ENABLE_TESTS=OFF || (Write-Error "CMake configure failed"; exit 1)
 
-    - name: Configure CMake (try Ninja, fallback to Visual Studio)
-      shell: pwsh
-      run: |
-        $toolchain = Join-Path $env:GITHUB_WORKSPACE 'vcpkg\scripts\buildsystems\vcpkg.cmake'
-        $buildDir = Join-Path $PWD 'build'
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $buildDir
-        New-Item -ItemType Directory -Path $buildDir | Out-Null
+      - name: Build (Release)
+        shell: pwsh
+        run: |
+          # Use --config Release to build Release configuration
+          cmake --build build --config Release --target ALL_BUILD -- /m || (Write-Error "Build failed"; exit 1)
 
-        Write-Host "Running CMake configure with Ninja..."
-        $cmakeArgs = @(
-          '-S', $PWD,
-          '-B', $buildDir,
-          '-A', 'x64',
-          "-DCMAKE_BUILD_TYPE=${env:BUILD_TYPE}",
-          "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
-          '-G', 'Ninja'
-        )
+      - name: Collect artifacts and package
+        shell: pwsh
+        run: |
+          $out = "$PWD\artifacts"
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          New-Item -ItemType Directory -Path $out | Out-Null
 
-        $ok = $false
-        try {
-          & cmake @cmakeArgs | Tee-Object -Variable cmout
-          if ($LASTEXITCODE -eq 0) { $ok = $true }
-        } catch {
-          Write-Host "Ninja configure failed, will try Visual Studio generator..."
-        }
+          # Common places where the built exe/packaged files are produced by VS/CMake
+          # Adjust these patterns if your build produces outputs in a different location.
+          $candidates = @(
+            "$PWD\build\bin\Release\*",
+            "$PWD\build\Release\*",
+            "$PWD\build\bin\*",
+            "$PWD\build\*"
+          )
 
-        if (-not $ok) {
-          Write-Host "Retrying CMake configure with Visual Studio 17 2022 generator..."
-          $cmakeArgs[-1] = 'Visual Studio 17 2022'  # replace 'Ninja' with VS generator
-          $cmakeArgs += ('-T','host=x64') # optional
-          & cmake @cmakeArgs | Tee-Object -Variable cmout2
+          $found = $false
+          foreach ($pat in $candidates) {
+            if (Test-Path $pat) {
+              Write-Host "Copying from $pat"
+              Copy-Item -Path $pat -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
+              $found = $true
+            }
+          }
+          if (-not $found) {
+            Write-Host "No usual output folders found; packing the entire build tree as a fallback."
+            Copy-Item -Path "$PWD\build\*" -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+          # Ensure edited source files are included for traceability (optional)
+          Copy-Item -Path "Source\Core\InputCommon\ControllerInterface\DualShockUDPClient\DualShockUDPClient.*" -Destination $out -ErrorAction SilentlyContinue
+
+          $zipName = "dolphin-windows-${{ github.run_id }}.zip"
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
+          Compress-Archive -Path "$out\*" -DestinationPath $zipName -Force
+          Write-Host "Packaged artifact: $zipName"
+          Write-Output "::set-output name=artifact::$zipName"
+
+      - name: Upload build artifact (actions artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-windows-${{ github.run_id }}
+          path: dolphin-windows-${{ github.run_id }}.zip
+
+      - name: Create GitHub release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: "Automated Windows build (x64) from workflow run ${{ github.run_id }}."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset
+        id: upload_asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dolphin-windows-${{ github.run_id }}.zip
+          asset_name: dolphin-windows-${{ github.run_id }}.zip
+          asset_content_type: application/zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Final status
+        if: always()
+        run: |
           if ($LASTEXITCODE -ne 0) {
-            Write-Output "CMake configure output (Ninja + VS attempts):"
-            $cmout
-            $cmout2
-            exit 1
+            Write-Host "One or more steps failed. Check the logs above for details."
+            exit $LASTEXITCODE
+          } else {
+            Write-Host "Workflow finished successfully."
           }
-        }
-
-    - name: Build (Release)
-      shell: pwsh
-      run: |
-        $buildDir = Join-Path $PWD 'build'
-        # Use cmake --build; if multi-config (VS), pass --config Release
-        cmake --build $buildDir --config Release -- /m
-
-    - name: Collect build output and package
-      shell: pwsh
-      run: |
-        $outdir = Join-Path $PWD 'artifacts'
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $outdir
-        New-Item -ItemType Directory -Path $outdir | Out-Null
-
-        # Adjust paths below if the real product binaries are in a different build output path.
-        $candidatePaths = @(
-          Join-Path $PWD 'build\bin\Release\*',
-          Join-Path $PWD 'build\bin\*',
-          Join-Path $PWD 'build\Release\*',
-          Join-Path $PWD 'build\*'
-        )
-
-        $found = $false
-        foreach ($p in $candidatePaths) {
-          if (Get-ChildItem -Path $p -ErrorAction SilentlyContinue) {
-            Write-Host "Including: $p"
-            Compress-Archive -Path $p -DestinationPath (Join-Path $outdir 'Dolphin-Windows-x64.zip') -Force
-            $found = $true
-            break
-          }
-        }
-        if (-not $found) {
-          Write-Host "Warning: couldn't find expected build outputs. Packaging entire repo as fallback."
-          Compress-Archive -Path (Join-Path $PWD '*') -DestinationPath (Join-Path $outdir 'Dolphin-Windows-x64.zip') -Force
-        }
-        Write-Host "artifact=" + (Join-Path $outdir 'Dolphin-Windows-x64.zip')
-
-    - name: Upload artifact (build archive)
-      uses: actions/upload-artifact@v4
-      with:
-        name: dolphin-windows-x64
-        path: artifacts/Dolphin-Windows-x64.zip
-
-    - name: Create GitHub release
-      id: create_release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ github.ref == 'refs/heads/master' && 'release-' + github.sha || 'manual-' + github.run_id }}
-        name: "Dolphin Windows x64 build ${{ github.sha }}"
-        body: |
-          Automated build from ${{ github.sha }} (branch: ${{ github.ref }}) — build_type: ${{ env.BUILD_TYPE }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload build zip to release
-      uses: actions/upload-release-asset@v1
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: artifacts/Dolphin-Windows-x64.zip
-        asset_name: Dolphin-Windows-x64.zip
-        asset_content_type: application/zip
-
-    - name: Final status
-      shell: pwsh
-      run: Write-Host "Workflow finished. If build failed, inspect vcpkg and CMake logs above."
