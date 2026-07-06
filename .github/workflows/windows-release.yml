@@ -44,22 +44,25 @@ jobs:
         run: |
           .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
 
-      - name: Configure & build (robust vswhere discovery, vcvars, then Ninja)
+      - name: Configure & build (robust env lookup, vcvars if needed, then Ninja)
         shell: pwsh
         run: |
           $buildType = $env:BUILD_TYPE
 
-          # Try to locate vswhere.exe in several likely places
+          # Safely read environment variables (won't throw if missing)
+          $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $pf    = [Environment]::GetEnvironmentVariable('ProgramFiles')
+
+          # Candidate locations for vswhere.exe
           $candidates = @()
-          if ($env['ProgramFiles(x86)']) {
-            $candidates += Join-Path $env['ProgramFiles(x86)'] 'Microsoft Visual Studio\Installer\vswhere.exe'
-            $candidates += Join-Path $env['ProgramFiles(x86)'] 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
+          if (-not [string]::IsNullOrEmpty($pf86)) {
+            $candidates += Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $candidates += Join-Path $pf86 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
           }
-          if ($env:ProgramFiles) {
-            $candidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe'
-            $candidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
+          if (-not [string]::IsNullOrEmpty($pf)) {
+            $candidates += Join-Path $pf 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $candidates += Join-Path $pf 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
           }
-          # Absolute fallbacks
           $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
           $candidates += 'C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe'
           $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
@@ -79,7 +82,7 @@ jobs:
             $vsInstall = $null
           }
 
-          # Fallback: common BuildTools path
+          # Fallback to common BuildTools path if vswhere returned nothing
           if (-not $vsInstall) {
             $fallback = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
             if (Test-Path $fallback) {
@@ -88,7 +91,7 @@ jobs:
             }
           }
 
-          # If cl.exe is already available on PATH, we can skip vcvars
+          # If cl.exe already on PATH, we can skip vcvars initialization
           $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
           if ($cl) {
             Write-Host "cl.exe already on PATH: $($cl.Path). Skipping vcvars."
@@ -111,10 +114,12 @@ jobs:
           }
 
           $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake')
+          $cmakeToolchain = $cmakeToolchain -replace '"','\"'
 
-          # Build command to run under cmd.exe so vcvars persists for subsequent commands
+          # Build commands executed under cmd.exe so vcvars persists for CMake/Ninja
           $cmakeCmd = "cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
           $buildCmd = "cmake --build build --config $buildType -- /m"
+
           if ($useVcvars) {
             $vcvarsEsc = $vcvars -replace '"','\"'
             $full = "call `"$vcvarsEsc`" && if exist build rd /s /q build && $cmakeCmd && $buildCmd"
@@ -122,10 +127,11 @@ jobs:
             $full = "if exist build rd /s /q build && $cmakeCmd && $buildCmd"
           }
 
-          Write-Host "Running: cmd.exe /c $full"
-          $exit = cmd.exe /c $full
+          Write-Host "Running build in cmd.exe..."
+          Write-Host $full
+          cmd.exe /c $full
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build command failed with code $LASTEXITCODE"
+            Write-Error "Build command failed with exit code $LASTEXITCODE"
             exit $LASTEXITCODE
           }
 
