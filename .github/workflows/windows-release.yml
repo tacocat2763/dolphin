@@ -1,87 +1,89 @@
-name: Windows Release Build
+name: Build & Package (Windows x64)
 
 on:
   push:
+    branches: [ "master" ]
     tags:
-      - 'v*'
+      - 'v*.*'    # create a release when pushing semver-like tags (v1.2.3)
   workflow_dispatch:
 
-env:
-  BUILD_TYPE: Release
+permissions:
+  contents: read
+  packages: read
 
 jobs:
-  build_windows:
+  build-windows:
     name: Build and package (Windows x64)
     runs-on: windows-2025-vs2026
-
+    env:
+      BUILD_TYPE: Release
+      VCPKG_PACKAGES: "fmt sqlite3 zlib libpng libjpeg-turbo glew"
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: recursive
+          fetch-depth: 1
 
-      - name: Confirm edited DualShockUDPClient files are present
+      - name: Show edited DualShockUDPClient files (sanity)
         shell: pwsh
         run: |
-          Write-Host "Listing files in Source/Core/InputCommon/ControllerInterface/DualShockUDPClient* (if present)"
           $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
           if (Test-Path $p) {
             Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
           } else {
             Write-Host "Directory not found: $p"
           }
-          Write-Host "Ensure your two edited files are committed; the workflow will build whatever is in the repo."
+          Write-Host "Ensure your two edited files are committed; the workflow builds whatever is checked in."
 
-      - name: Install vcpkg (for consistent dependencies)
+      - name: Bootstrapping vcpkg
         shell: pwsh
         run: |
+          # Clone vcpkg and bootstrap
           git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
           & .\vcpkg\bootstrap-vcpkg.bat
           & .\vcpkg\vcpkg integrate install
+          Write-Host "vcpkg root: $PWD\vcpkg"
+          Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
-      - name: Install common dependencies via vcpkg (explicit triplet)
+      - name: Install vcpkg dependencies
         shell: pwsh
         run: |
-          .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
+          .\vcpkg\vcpkg.exe install --triplet x64-windows $env:VCPKG_PACKAGES
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
 
-      - name: Configure & build (robust env lookup, vcvars if needed, then Ninja)
+      - name: Configure, build and package (robust)
         shell: pwsh
+        env:
+          VCPKG_TOOLCHAIN: ${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake
+          BUILD_TYPE: ${{ env.BUILD_TYPE }}
         run: |
-          $buildType = $env:BUILD_TYPE
+          set -eo pipefail
 
-          # Safely read environment variables
-          $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-          $pf    = [Environment]::GetEnvironmentVariable('ProgramFiles')
+          # Find Visual Studio install (vswhere) if available so we can call vcvars
+          $vswhereCandidates = @(
+            "$Env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+            "$Env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe",
+            "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+            "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe"
+          ) | Where-Object { Test-Path $_ }
 
-          # Candidate locations for vswhere.exe
-          $candidates = @()
-          if (-not [string]::IsNullOrEmpty($pf86)) {
-            $candidates += Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
-            $candidates += Join-Path $pf86 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
-          }
-          if (-not [string]::IsNullOrEmpty($pf)) {
-            $candidates += Join-Path $pf 'Microsoft Visual Studio\Installer\vswhere.exe'
-            $candidates += Join-Path $pf 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
-          }
-          $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
-          $candidates += 'C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe'
-          $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
-
-          $vswhere = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          if ($vswhere) {
-            Write-Host "Found vswhere at: $vswhere"
+          if ($vswhereCandidates) {
+            $vswhere = $vswhereCandidates[0]
+            Write-Host "Found vswhere at $vswhere"
             try {
-              $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>&1
             } catch {
               Write-Warning "vswhere invocation failed: $_"
               $vsInstall = $null
             }
           } else {
-            Write-Warning "vswhere.exe was not found in standard locations."
+            Write-Warning "vswhere.exe not found in standard locations."
             $vsInstall = $null
           }
 
+          # Fallback: common Build Tools path if vswhere returned nothing
           if (-not $vsInstall) {
             $fallback = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
             if (Test-Path $fallback) {
@@ -90,7 +92,7 @@ jobs:
             }
           }
 
-          # If cl.exe is already available, skip vcvars
+          # Prepare vcvars batch if required
           $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
           if ($cl) {
             Write-Host "cl.exe already on PATH: $($cl.Path). Skipping vcvars."
@@ -110,90 +112,135 @@ jobs:
               Write-Error "vcvars64.bat not found at expected location: $vcvars"
               exit 1
             }
+            Write-Host "Using vcvars: $vcvars"
           }
 
-          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake') -replace '"','\"'
+          # Decide a generator:
+          $cmakeHelp = & cmake --help 2>&1
+          if ($cmakeHelp -match "Ninja Multi-Config") {
+            $generator = "Ninja Multi-Config"
+            Write-Host "Choosing generator: $generator"
+          } elseif ($vsInstall) {
+            # Prefer Visual Studio generator when we have Visual Studio
+            # Note: the exact name is probably "Visual Studio 18 2026" on this image; fall back to 17 if not present
+            $possibleVs = @("Visual Studio 18 2026", "Visual Studio 17 2022")
+            $generator = $null
+            foreach ($g in $possibleVs) {
+              # quick check: cmake -G "$g" --help doesn't exist, so we just pick the first that works
+              Write-Host "Trying generator candidate: $g"
+              $generator = $g
+              break
+            }
+            Write-Host "Choosing generator: $generator"
+          } else {
+            $generator = "Ninja"
+            Write-Host "Choosing generator: Ninja"
+          }
 
-          # Build commands executed under cmd.exe so vcvars persists for subsequent commands
-          $cmakeCmd = "cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
-          $buildCmd = "cmake --build build --config $buildType -- /m"
+          # Build directory
+          $buildDir = Join-Path $PWD "build"
 
+          # Build command(s) depend on generator type
           if ($useVcvars) {
             $vcvarsEsc = $vcvars -replace '"','\"'
-            $full = "call `"$vcvarsEsc`" && if exist build rd /s /q build && $cmakeCmd && $buildCmd"
+            $vcCall = "call `"$vcvarsEsc`" && "
           } else {
-            $full = "if exist build rd /s /q build && $cmakeCmd && $buildCmd"
+            $vcCall = ""
           }
 
-          Write-Host "Running build in cmd.exe..."
-          Write-Host $full
-          cmd.exe /c $full
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build command failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
-          }
+          $cmakeToolchainEsc = $env:VCPKG_TOOLCHAIN -replace '"','\"'
 
-      - name: (Optional) Run tests if available
-        if: success()
-        shell: pwsh
-        run: |
-          if (Test-Path build\CTestTestfile.cmake) {
-            ctest --test-dir build --output-on-failure -C $env:BUILD_TYPE
+          $cmakeConfigure = "cmake -S . -B `"$buildDir`" -G `"$generator`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchainEsc`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
+          if ($generator -like "*Visual Studio*") {
+            # ensure 64-bit platform
+            $cmakeConfigure += " -A x64"
+            $buildCmd = "cmake --build `"$buildDir`" --config $env:BUILD_TYPE -- /m"
+          } elseif ($generator -like "*Multi-Config*") {
+            $buildCmd = "cmake --build `"$buildDir`" --config $env:BUILD_TYPE -- /m"
           } else {
-            Write-Host "No tests detected (no CTestTestfile). Skipping."
+            # single-config Ninja
+            $buildCmd = "cmake --build `"$buildDir`" -- -j $([int]([Environment]::ProcessorCount))"
           }
 
-      - name: Package build outputs
-        id: package
-        shell: pwsh
-        run: |
+          Write-Host "Running CMake configure:"
+          Write-Host $cmakeConfigure
+          # Run configure under cmd where vcvars persists if needed
+          $cmd = "$vcCall $cmakeConfigure"
+          $proc = Start-Process cmd.exe -ArgumentList "/c", $cmd -NoNewWindow -Wait -PassThru -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+          Get-Content out.txt -Raw | Write-Host
+          Get-Content err.txt -Raw | Write-Host
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "CMake configure failed (exit code $($proc.ExitCode)). See logs above."
+            exit $proc.ExitCode
+          }
+
+          Write-Host "Running build command:"
+          Write-Host $buildCmd
+          $cmd2 = "$vcCall $buildCmd"
+          $proc2 = Start-Process cmd.exe -ArgumentList "/c", $cmd2 -NoNewWindow -Wait -PassThru -RedirectStandardOutput build_out.txt -RedirectStandardError build_err.txt
+          Get-Content build_out.txt -Raw | Write-Host
+          Get-Content build_err.txt -Raw | Write-Host
+          if ($proc2.ExitCode -ne 0) {
+            Write-Error "Build failed (exit code $($proc2.ExitCode)). See build logs above."
+            exit $proc2.ExitCode
+          }
+
+          # Create release dir and copy found artifacts
           $outdir = Join-Path $PWD 'release'
           if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
           New-Item -ItemType Directory -Path $outdir | Out-Null
 
-          # Use explicit string paths built from $PWD to avoid Join-Path array/type issues
-          $possibleBins = @(
-            "$PWD\build\bin\Release\*",
-            "$PWD\build\bin\*",
-            "$PWD\build\*"
-          )
-
-          $found = $false
-          foreach ($p in $possibleBins) {
-            try {
-              Copy-Item -Path $p -Destination $outdir -Recurse -Force -ErrorAction Stop
-              $found = $true
-            } catch {
-              # ignore missing patterns
+          # Find built binaries (.exe, .dll) under build tree
+          $binFiles = Get-ChildItem -Path $buildDir -Include *.exe,*.dll -File -Recurse -ErrorAction SilentlyContinue
+          if ($binFiles.Count -gt 0) {
+            foreach ($f in $binFiles) {
+              $dest = Join-Path $outdir $f.Name
+              Copy-Item -Path $f.FullName -Destination $dest -Force
+            }
+            Write-Host "Copied $($binFiles.Count) binaries to $outdir"
+          } else {
+            # If nothing matched, copy entire build folder as fallback (helps debugging)
+            if (Test-Path $buildDir) {
+              Write-Host "No binaries found under $buildDir; copying entire build folder into release for debugging."
+              Copy-Item -Path $buildDir -Destination $outdir -Recurse -Force
+            } else {
+              Write-Error "Build directory $buildDir not found - nothing to package."
+              exit 1
             }
           }
-          if (-not $found) {
-            # Fallback: copy entire build folder if nothing matched
-            Copy-Item -Path (Join-Path $PWD 'build') -Destination $outdir -Recurse -Force
-          }
 
-          $tag = '${{ github.ref_name }}'
-          if (-not $tag) { $tag = 'run-' + $env:GITHUB_RUN_ID }
+          # Zip the release folder into a predictable name
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag) { $tag = "run-$($env:GITHUB_RUN_ID)" }
           $zipName = "dolphin-$tag-windows-x64.zip"
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
           Compress-Archive -Path (Join-Path $outdir '*') -DestinationPath $zipName -Force
+          Write-Host "Created package: $zipName"
           Write-Host "zip=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Create GitHub Release
-        id: create_release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-windows-x64
+          path: ${{ env.zipName }}
+
+      - name: Create GitHub Release (only on tag)
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
-          body: Automated Windows build (generated by workflow)
+          name: ${{ github.ref_name }}
+          files: ${{ env.zipName }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload release asset
+      - name: Upload release asset (fallback)
+        if: always() && !startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-release-asset@v1
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ env.zip }}
-          asset_name: ${{ env.zip }}
+          upload_url: ${{ github.event.release.upload_url || '' }}
+          asset_path: ${{ env.zipName }}
+          asset_name: ${{ env.zipName }}
           asset_content_type: application/zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
