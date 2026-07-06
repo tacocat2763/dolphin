@@ -3,42 +3,24 @@
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
-          $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          $cmakeToolchain = Join-Path $env:VCPKG_ROOT 'scripts\buildsystems\vcpkg.cmake'
+          $buildType = $env:BUILD_TYPE
           Write-Host "Using vcpkg toolchain: $cmakeToolchain"
-
-          # Ensure a clean out-of-source build directory
-          $buildDir = Join-Path $PWD "build"
-          if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
-          New-Item -ItemType Directory -Path $buildDir | Out-Null
-
-          # Configure CMake with explicit generator and architecture.
-          # Note: for Visual Studio generators CMAKE_BUILD_TYPE is ignored (multi-config),
-          # but we leave BUILD_TYPE usage for consistency with other platforms.
-          cmake -S Source -B $buildDir `
+          Write-Host "Build type: $buildType"
+          # Explicit generator + architecture and point CMake at vcpkg toolchain file.
+          # Use PowerShell env vars ($env:...) instead of GitHub expressions inside the script.
+          cmake -S "Source" -B "build" `
             -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE="$buildType" `
             -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" `
-            -DVCPKG_TARGET_TRIPLET="${{ env.VCPKG_TRIPLET }}" `
+            -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TRIPLET" `
             -DBUILD_SHARED_LIBS=OFF `
             -DDOLPHIN_ENABLE_TESTS=OFF
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "CMake configure failed (exit code $LASTEXITCODE)"
-            exit $LASTEXITCODE
-          }
+          if ($LASTEXITCODE -ne 0) { Write-Error "CMake configure failed"; exit 1 }
 
       - name: Build (Release)
         shell: pwsh
         run: |
-          $buildDir = Join-Path $PWD "build"
-          if (-not (Test-Path $buildDir)) {
-            Write-Error "Build directory not found: $buildDir"
-            exit 1
-          }
-
-          # Build Release configuration (multi-config generator)
-          cmake --build $buildDir --config Release --target ALL_BUILD -- /m
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed (exit code $LASTEXITCODE)"
-            exit $LASTEXITCODE
-          }
+          # Build the Release configuration for multi-config generators (Visual Studio)
+          cmake --build "build" --config Release --target ALL_BUILD -- /m
+          if ($LASTEXITCODE -ne 0) { Write-Error "Build failed"; exit 1 }
