@@ -47,10 +47,10 @@ jobs:
       - name: Configure & build (initialize MSVC env then use Ninja)
         shell: pwsh
         run: |
-          # Find vswhere reliably
+          $programFilesX86 = $env['ProgramFiles(x86)']
           $vswherePaths = @(
-            Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe' 2>$null,
-            Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe' 2>$null
+            Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe',
+            Join-Path $programFilesX86 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
           )
           $vswhere = $vswherePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $vswhere) {
@@ -59,8 +59,7 @@ jobs:
           }
           $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vsInstall) {
-            # If vswhere returned nothing, fall back to BuildTools default path if present
-            $fallback = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools'
+            $fallback = Join-Path $programFilesX86 'Microsoft Visual Studio\2022\BuildTools'
             if (Test-Path $fallback) { $vsInstall = $fallback }
           }
           if (-not $vsInstall) {
@@ -73,11 +72,12 @@ jobs:
             exit 1
           }
 
-          # Build commands must run in the same cmd session where vcvars64 was called.
-          # Compose a single cmd.exe /c command to call vcvars64 and run cmake + build.
-          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake').Replace('"','`"')
-          $vcvarsEscaped = $vcvars.Replace('"','`"')
-          $cmd = "call `"$vcvarsEscaped`" && if exist build rd /s /q build && cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW && cmake --build build --config $env:BUILD_TYPE -- /m"
+          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake')
+
+          # Run vcvars64 and then cmake + build in the same cmd session so environment changes persist
+          $vcvarsQuoted = $vcvars -replace '"','\"'
+          $cmakeToolchainQuoted = $cmakeToolchain -replace '"','\"'
+          $cmd = "call `"$vcvarsQuoted`" && if exist build rd /s /q build && cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchainQuoted`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW && cmake --build build --config $env:BUILD_TYPE -- /m"
           Write-Host "Running build command in cmd.exe..."
           cmd.exe /c $cmd
 
