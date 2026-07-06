@@ -44,42 +44,90 @@ jobs:
         run: |
           .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
 
-      - name: Configure & build (initialize MSVC env then use Ninja)
+      - name: Configure & build (robust vswhere discovery, vcvars, then Ninja)
         shell: pwsh
         run: |
-          $programFilesX86 = $env['ProgramFiles(x86)']
-          $vswherePaths = @(
-            Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe',
-            Join-Path $programFilesX86 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
-          )
-          $vswhere = $vswherePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $vswhere) {
-            Write-Error "vswhere.exe not found under ProgramFiles(x86). Cannot locate Visual Studio. Ensure runner image has Build Tools / Visual Studio."
-            exit 1
+          $buildType = $env:BUILD_TYPE
+
+          # Try to locate vswhere.exe in several likely places
+          $candidates = @()
+          if ($env['ProgramFiles(x86)']) {
+            $candidates += Join-Path $env['ProgramFiles(x86)'] 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $candidates += Join-Path $env['ProgramFiles(x86)'] 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
           }
-          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($env:ProgramFiles) {
+            $candidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $candidates += Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
+          }
+          # Absolute fallbacks
+          $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $candidates += 'C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe'
+          $candidates += 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe'
+
+          $vswhere = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($vswhere) {
+            Write-Host "Found vswhere at: $vswhere"
+            try {
+              $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            } catch {
+              Write-Warning "vswhere invocation failed: $_"
+              $vsInstall = $null
+            }
+          } else {
+            Write-Warning "vswhere.exe was not found in standard locations."
+            $vsInstall = $null
+          }
+
+          # Fallback: common BuildTools path
           if (-not $vsInstall) {
-            $fallback = Join-Path $programFilesX86 'Microsoft Visual Studio\2022\BuildTools'
-            if (Test-Path $fallback) { $vsInstall = $fallback }
+            $fallback = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+            if (Test-Path $fallback) {
+              Write-Host "Falling back to $fallback"
+              $vsInstall = $fallback
+            }
           }
-          if (-not $vsInstall) {
-            Write-Error "Visual Studio installation not found (vswhere returned empty)."
+
+          # If cl.exe is already available on PATH, we can skip vcvars
+          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+          if ($cl) {
+            Write-Host "cl.exe already on PATH: $($cl.Path). Skipping vcvars."
+            $useVcvars = $false
+          } else {
+            $useVcvars = $true
+          }
+
+          if ($useVcvars -and -not $vsInstall) {
+            Write-Error "Visual Studio / Build Tools not found and cl.exe not on PATH. Cannot configure MSVC environment."
             exit 1
           }
-          $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
-          if (-not (Test-Path $vcvars)) {
-            Write-Error "vcvars64.bat not found at $vcvars"
-            exit 1
+
+          if ($useVcvars) {
+            $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
+            if (-not (Test-Path $vcvars)) {
+              Write-Error "vcvars64.bat not found at expected location: $vcvars"
+              exit 1
+            }
           }
 
           $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake')
 
-          # Run vcvars64 and then cmake + build in the same cmd session so environment changes persist
-          $vcvarsQuoted = $vcvars -replace '"','\"'
-          $cmakeToolchainQuoted = $cmakeToolchain -replace '"','\"'
-          $cmd = "call `"$vcvarsQuoted`" && if exist build rd /s /q build && cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchainQuoted`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW && cmake --build build --config $env:BUILD_TYPE -- /m"
-          Write-Host "Running build command in cmd.exe..."
-          cmd.exe /c $cmd
+          # Build command to run under cmd.exe so vcvars persists for subsequent commands
+          $cmakeCmd = "cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
+          $buildCmd = "cmake --build build --config $buildType -- /m"
+          if ($useVcvars) {
+            $vcvarsEsc = $vcvars -replace '"','\"'
+            $full = "call `"$vcvarsEsc`" && if exist build rd /s /q build && $cmakeCmd && $buildCmd"
+          } else {
+            $full = "if exist build rd /s /q build && $cmakeCmd && $buildCmd"
+          }
+
+          Write-Host "Running: cmd.exe /c $full"
+          $exit = cmd.exe /c $full
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build command failed with code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
 
       - name: (Optional) Run tests if available
         if: success()
