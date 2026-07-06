@@ -12,7 +12,7 @@ env:
 jobs:
   build_windows:
     name: Build and package (Windows x64)
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout repository
@@ -49,7 +49,7 @@ jobs:
         run: |
           $buildType = $env:BUILD_TYPE
 
-          # Safely read environment variables (won't throw if missing)
+          # Safely read environment variables
           $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
           $pf    = [Environment]::GetEnvironmentVariable('ProgramFiles')
 
@@ -82,7 +82,6 @@ jobs:
             $vsInstall = $null
           }
 
-          # Fallback to common BuildTools path if vswhere returned nothing
           if (-not $vsInstall) {
             $fallback = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
             if (Test-Path $fallback) {
@@ -91,7 +90,7 @@ jobs:
             }
           }
 
-          # If cl.exe already on PATH, we can skip vcvars initialization
+          # If cl.exe is already available, skip vcvars
           $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
           if ($cl) {
             Write-Host "cl.exe already on PATH: $($cl.Path). Skipping vcvars."
@@ -113,10 +112,9 @@ jobs:
             }
           }
 
-          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake')
-          $cmakeToolchain = $cmakeToolchain -replace '"','\"'
+          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake') -replace '"','\"'
 
-          # Build commands executed under cmd.exe so vcvars persists for CMake/Ninja
+          # Build commands executed under cmd.exe so vcvars persists for subsequent commands
           $cmakeCmd = "cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
           $buildCmd = "cmake --build build --config $buildType -- /m"
 
@@ -152,11 +150,14 @@ jobs:
           $outdir = Join-Path $PWD 'release'
           if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
           New-Item -ItemType Directory -Path $outdir | Out-Null
+
+          # Use explicit string paths built from $PWD to avoid Join-Path array/type issues
           $possibleBins = @(
-            Join-Path $PWD 'build\bin\Release\*' ,
-            Join-Path $PWD 'build\bin\*' ,
-            Join-Path $PWD 'build\*'
+            "$PWD\build\bin\Release\*",
+            "$PWD\build\bin\*",
+            "$PWD\build\*"
           )
+
           $found = $false
           foreach ($p in $possibleBins) {
             try {
@@ -167,8 +168,10 @@ jobs:
             }
           }
           if (-not $found) {
+            # Fallback: copy entire build folder if nothing matched
             Copy-Item -Path (Join-Path $PWD 'build') -Destination $outdir -Recurse -Force
           }
+
           $tag = '${{ github.ref_name }}'
           if (-not $tag) { $tag = 'run-' + $env:GITHUB_RUN_ID }
           $zipName = "dolphin-$tag-windows-x64.zip"
