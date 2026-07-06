@@ -1,246 +1,161 @@
-name: Build & Package (Windows x64)
-
+# Build + package Dolphin on Windows x64 and create a release.
+# - Installs vcpkg and selected ports
+# - Configures CMake with vcpkg toolchain
+# - Builds Release, packages output into a zip
+# - Creates a GitHub release & uploads the zip
 on:
   push:
-    branches: [ "master" ]
-    tags:
-      - 'v*.*'    # create a release when pushing semver-like tags (v1.2.3)
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: read
+    branches:
+      - master
+  workflow_dispatch: {}
 
 jobs:
-  build-windows:
+  build_windows:
     name: Build and package (Windows x64)
     runs-on: windows-2025-vs2026
+
     env:
       BUILD_TYPE: Release
-      VCPKG_PACKAGES: "fmt sqlite3 zlib libpng libjpeg-turbo glew"
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 1
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 1
 
-      - name: Show edited DualShockUDPClient files (sanity)
-        shell: pwsh
-        run: |
-          $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
-          if (Test-Path $p) {
-            Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-          } else {
-            Write-Host "Directory not found: $p"
-          }
-          Write-Host "Ensure your two edited files are committed; the workflow builds whatever is checked in."
+    - name: List the two edited files (sanity)
+      shell: pwsh
+      run: |
+        $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
+        if (Test-Path $p) {
+          Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+        } else {
+          Write-Host "Directory not found: $p"
+        }
+        Write-Host "Ensure your two edited files are committed; the workflow builds whatever is checked in."
 
-      - name: Bootstrapping vcpkg
-        shell: pwsh
-        run: |
-          # Clone vcpkg and bootstrap
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          & .\vcpkg\bootstrap-vcpkg.bat
-          & .\vcpkg\vcpkg integrate install
-          Write-Host "vcpkg root: $PWD\vcpkg"
-          Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
+    - name: Clone and bootstrap vcpkg
+      shell: pwsh
+      run: |
+        git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+        .\vcpkg\bootstrap-vcpkg.bat
+        .\vcpkg\vcpkg integrate install
+        Write-Host "vcpkg root: $PWD\vcpkg"
+        Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
-      - name: Install vcpkg dependencies
-        shell: pwsh
-        run: |
-          .\vcpkg\vcpkg.exe install --triplet x64-windows $env:VCPKG_PACKAGES
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+    - name: Install vcpkg ports (explicit args — avoids PowerShell single-arg bug)
+      shell: pwsh
+      run: |
+        # IMPORTANT: pass packages as separate argv items so vcpkg parses them individually
+        .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
 
-      - name: Configure, build and package (robust)
-        shell: pwsh
-        env:
-          VCPKG_TOOLCHAIN: ${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake
-          BUILD_TYPE: ${{ env.BUILD_TYPE }}
-        run: |
-          set -eo pipefail
+    - name: Show vcpkg list (diagnostic)
+      shell: pwsh
+      run: .\vcpkg\vcpkg.exe list
 
-          # Find Visual Studio install (vswhere) if available so we can call vcvars
-          $vswhereCandidates = @(
-            "$Env:ProgramFiles(x86)\Microsoft Visual Studio\Installer\vswhere.exe",
-            "$Env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe",
-            "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
-            "C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe"
-          ) | Where-Object { Test-Path $_ }
+    - name: Configure CMake (try Ninja, fallback to Visual Studio)
+      shell: pwsh
+      run: |
+        $toolchain = Join-Path $env:GITHUB_WORKSPACE 'vcpkg\scripts\buildsystems\vcpkg.cmake'
+        $buildDir = Join-Path $PWD 'build'
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $buildDir
+        New-Item -ItemType Directory -Path $buildDir | Out-Null
 
-          if ($vswhereCandidates) {
-            $vswhere = $vswhereCandidates[0]
-            Write-Host "Found vswhere at $vswhere"
-            try {
-              $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>&1
-            } catch {
-              Write-Warning "vswhere invocation failed: $_"
-              $vsInstall = $null
-            }
-          } else {
-            Write-Warning "vswhere.exe not found in standard locations."
-            $vsInstall = $null
-          }
+        Write-Host "Running CMake configure with Ninja..."
+        $cmakeArgs = @(
+          '-S', $PWD,
+          '-B', $buildDir,
+          '-A', 'x64',
+          "-DCMAKE_BUILD_TYPE=${env:BUILD_TYPE}",
+          "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+          '-G', 'Ninja'
+        )
 
-          # Fallback: common Build Tools path if vswhere returned nothing
-          if (-not $vsInstall) {
-            $fallback = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
-            if (Test-Path $fallback) {
-              Write-Host "Falling back to $fallback"
-              $vsInstall = $fallback
-            }
-          }
+        $ok = $false
+        try {
+          & cmake @cmakeArgs | Tee-Object -Variable cmout
+          if ($LASTEXITCODE -eq 0) { $ok = $true }
+        } catch {
+          Write-Host "Ninja configure failed, will try Visual Studio generator..."
+        }
 
-          # Prepare vcvars batch if required
-          $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
-          if ($cl) {
-            Write-Host "cl.exe already on PATH: $($cl.Path). Skipping vcvars."
-            $useVcvars = $false
-          } else {
-            $useVcvars = $true
-          }
-
-          if ($useVcvars -and -not $vsInstall) {
-            Write-Error "Visual Studio / Build Tools not found and cl.exe not on PATH. Cannot configure MSVC environment."
+        if (-not $ok) {
+          Write-Host "Retrying CMake configure with Visual Studio 17 2022 generator..."
+          $cmakeArgs[-1] = 'Visual Studio 17 2022'  # replace 'Ninja' with VS generator
+          $cmakeArgs += ('-T','host=x64') # optional
+          & cmake @cmakeArgs | Tee-Object -Variable cmout2
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "CMake configure output (Ninja + VS attempts):"
+            $cmout
+            $cmout2
             exit 1
           }
+        }
 
-          if ($useVcvars) {
-            $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
-            if (-not (Test-Path $vcvars)) {
-              Write-Error "vcvars64.bat not found at expected location: $vcvars"
-              exit 1
-            }
-            Write-Host "Using vcvars: $vcvars"
+    - name: Build (Release)
+      shell: pwsh
+      run: |
+        $buildDir = Join-Path $PWD 'build'
+        # Use cmake --build; if multi-config (VS), pass --config Release
+        cmake --build $buildDir --config Release -- /m
+
+    - name: Collect build output and package
+      shell: pwsh
+      run: |
+        $outdir = Join-Path $PWD 'artifacts'
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $outdir
+        New-Item -ItemType Directory -Path $outdir | Out-Null
+
+        # Adjust paths below if the real product binaries are in a different build output path.
+        $candidatePaths = @(
+          Join-Path $PWD 'build\bin\Release\*',
+          Join-Path $PWD 'build\bin\*',
+          Join-Path $PWD 'build\Release\*',
+          Join-Path $PWD 'build\*'
+        )
+
+        $found = $false
+        foreach ($p in $candidatePaths) {
+          if (Get-ChildItem -Path $p -ErrorAction SilentlyContinue) {
+            Write-Host "Including: $p"
+            Compress-Archive -Path $p -DestinationPath (Join-Path $outdir 'Dolphin-Windows-x64.zip') -Force
+            $found = $true
+            break
           }
+        }
+        if (-not $found) {
+          Write-Host "Warning: couldn't find expected build outputs. Packaging entire repo as fallback."
+          Compress-Archive -Path (Join-Path $PWD '*') -DestinationPath (Join-Path $outdir 'Dolphin-Windows-x64.zip') -Force
+        }
+        Write-Host "artifact=" + (Join-Path $outdir 'Dolphin-Windows-x64.zip')
 
-          # Decide a generator:
-          $cmakeHelp = & cmake --help 2>&1
-          if ($cmakeHelp -match "Ninja Multi-Config") {
-            $generator = "Ninja Multi-Config"
-            Write-Host "Choosing generator: $generator"
-          } elseif ($vsInstall) {
-            # Prefer Visual Studio generator when we have Visual Studio
-            # Note: the exact name is probably "Visual Studio 18 2026" on this image; fall back to 17 if not present
-            $possibleVs = @("Visual Studio 18 2026", "Visual Studio 17 2022")
-            $generator = $null
-            foreach ($g in $possibleVs) {
-              # quick check: cmake -G "$g" --help doesn't exist, so we just pick the first that works
-              Write-Host "Trying generator candidate: $g"
-              $generator = $g
-              break
-            }
-            Write-Host "Choosing generator: $generator"
-          } else {
-            $generator = "Ninja"
-            Write-Host "Choosing generator: Ninja"
-          }
+    - name: Upload artifact (build archive)
+      uses: actions/upload-artifact@v4
+      with:
+        name: dolphin-windows-x64
+        path: artifacts/Dolphin-Windows-x64.zip
 
-          # Build directory
-          $buildDir = Join-Path $PWD "build"
+    - name: Create GitHub release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.ref == 'refs/heads/master' && 'release-' + github.sha || 'manual-' + github.run_id }}
+        name: "Dolphin Windows x64 build ${{ github.sha }}"
+        body: |
+          Automated build from ${{ github.sha }} (branch: ${{ github.ref }}) — build_type: ${{ env.BUILD_TYPE }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          # Build command(s) depend on generator type
-          if ($useVcvars) {
-            $vcvarsEsc = $vcvars -replace '"','\"'
-            $vcCall = "call `"$vcvarsEsc`" && "
-          } else {
-            $vcCall = ""
-          }
+    - name: Upload build zip to release
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: artifacts/Dolphin-Windows-x64.zip
+        asset_name: Dolphin-Windows-x64.zip
+        asset_content_type: application/zip
 
-          $cmakeToolchainEsc = $env:VCPKG_TOOLCHAIN -replace '"','\"'
-
-          $cmakeConfigure = "cmake -S . -B `"$buildDir`" -G `"$generator`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchainEsc`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW"
-          if ($generator -like "*Visual Studio*") {
-            # ensure 64-bit platform
-            $cmakeConfigure += " -A x64"
-            $buildCmd = "cmake --build `"$buildDir`" --config $env:BUILD_TYPE -- /m"
-          } elseif ($generator -like "*Multi-Config*") {
-            $buildCmd = "cmake --build `"$buildDir`" --config $env:BUILD_TYPE -- /m"
-          } else {
-            # single-config Ninja
-            $buildCmd = "cmake --build `"$buildDir`" -- -j $([int]([Environment]::ProcessorCount))"
-          }
-
-          Write-Host "Running CMake configure:"
-          Write-Host $cmakeConfigure
-          # Run configure under cmd where vcvars persists if needed
-          $cmd = "$vcCall $cmakeConfigure"
-          $proc = Start-Process cmd.exe -ArgumentList "/c", $cmd -NoNewWindow -Wait -PassThru -RedirectStandardOutput out.txt -RedirectStandardError err.txt
-          Get-Content out.txt -Raw | Write-Host
-          Get-Content err.txt -Raw | Write-Host
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "CMake configure failed (exit code $($proc.ExitCode)). See logs above."
-            exit $proc.ExitCode
-          }
-
-          Write-Host "Running build command:"
-          Write-Host $buildCmd
-          $cmd2 = "$vcCall $buildCmd"
-          $proc2 = Start-Process cmd.exe -ArgumentList "/c", $cmd2 -NoNewWindow -Wait -PassThru -RedirectStandardOutput build_out.txt -RedirectStandardError build_err.txt
-          Get-Content build_out.txt -Raw | Write-Host
-          Get-Content build_err.txt -Raw | Write-Host
-          if ($proc2.ExitCode -ne 0) {
-            Write-Error "Build failed (exit code $($proc2.ExitCode)). See build logs above."
-            exit $proc2.ExitCode
-          }
-
-          # Create release dir and copy found artifacts
-          $outdir = Join-Path $PWD 'release'
-          if (Test-Path $outdir) { Remove-Item -Recurse -Force $outdir }
-          New-Item -ItemType Directory -Path $outdir | Out-Null
-
-          # Find built binaries (.exe, .dll) under build tree
-          $binFiles = Get-ChildItem -Path $buildDir -Include *.exe,*.dll -File -Recurse -ErrorAction SilentlyContinue
-          if ($binFiles.Count -gt 0) {
-            foreach ($f in $binFiles) {
-              $dest = Join-Path $outdir $f.Name
-              Copy-Item -Path $f.FullName -Destination $dest -Force
-            }
-            Write-Host "Copied $($binFiles.Count) binaries to $outdir"
-          } else {
-            # If nothing matched, copy entire build folder as fallback (helps debugging)
-            if (Test-Path $buildDir) {
-              Write-Host "No binaries found under $buildDir; copying entire build folder into release for debugging."
-              Copy-Item -Path $buildDir -Destination $outdir -Recurse -Force
-            } else {
-              Write-Error "Build directory $buildDir not found - nothing to package."
-              exit 1
-            }
-          }
-
-          # Zip the release folder into a predictable name
-          $tag = $env:GITHUB_REF_NAME
-          if (-not $tag) { $tag = "run-$($env:GITHUB_RUN_ID)" }
-          $zipName = "dolphin-$tag-windows-x64.zip"
-          if (Test-Path $zipName) { Remove-Item $zipName -Force }
-          Compress-Archive -Path (Join-Path $outdir '*') -DestinationPath $zipName -Force
-          Write-Host "Created package: $zipName"
-          Write-Host "zip=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dolphin-windows-x64
-          path: ${{ env.zipName }}
-
-      - name: Create GitHub Release (only on tag)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          files: ${{ env.zipName }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload release asset (fallback)
-        if: always() && !startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ github.event.release.upload_url || '' }}
-          asset_path: ${{ env.zipName }}
-          asset_name: ${{ env.zipName }}
-          asset_content_type: application/zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Final status
+      shell: pwsh
+      run: Write-Host "Workflow finished. If build failed, inspect vcpkg and CMake logs above."
