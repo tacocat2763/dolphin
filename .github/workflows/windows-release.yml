@@ -1,8 +1,9 @@
 # Windows build + release workflow for tacocat2763/dolphin
 # - Builds Dolphin on Windows x64 using CMake + vcpkg
-# - Installs vcpkg packages one-by-one to avoid PowerShell/vcpkg splitting bug
+# - Avoids the PowerShell/vcpkg package-splitting bug by installing packages one-by-one
 # - Uses vcpkg toolchain file when configuring CMake
 # - Creates a GitHub release and uploads the produced ZIP artifact
+# Trigger: push to master, push tags, or manual workflow_dispatch
 on:
   push:
     branches: [ "master" ]
@@ -37,7 +38,6 @@ jobs:
           fetch-depth: 1
 
       - name: Show edited files (DualShockUDPClient) for visibility
-        shell: pwsh
         run: |
           $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
           if (Test-Path $p) {
@@ -72,7 +72,7 @@ jobs:
             & .\vcpkg\vcpkg.exe install --triplet $env:VCPKG_TRIPLET $p
           }
 
-      - name: Configure CMake (generate) - FIXED
+      - name: Configure CMake (generate)
         shell: pwsh
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
@@ -91,16 +91,20 @@ jobs:
 
           Push-Location $buildDir
 
-          # Use Visual Studio generator + x64 and pass the vcpkg toolchain file explicitly.
-          # We call cmake from the build directory and point it at the Source dir to avoid generator/toolchain path issues.
-          cmake `
+          # Call cmake from the build directory, explicitly invoke the toolchain and triplet.
+          & cmake `
             -G "Visual Studio 17 2022" `
             -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" `
-            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
             -DBUILD_SHARED_LIBS=OFF `
             -DDOLPHIN_ENABLE_TESTS=OFF `
-            "$sourceDir" || (Write-Error "CMake configure failed"; exit 1)
+            "$sourceDir"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "CMake configure failed (exit code $LASTEXITCODE)"
+            exit $LASTEXITCODE
+          }
 
           Pop-Location
 
@@ -173,7 +177,6 @@ jobs:
 
       - name: Final status
         if: always()
-        shell: pwsh
         run: |
           if ($LASTEXITCODE -ne 0) {
             Write-Host "One or more steps failed. Check the logs above for details."
