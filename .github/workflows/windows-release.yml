@@ -25,6 +25,8 @@ jobs:
   build-and-release-windows:
     name: Build and package (Windows x64)
     runs-on: windows-2025-vs2026
+    # If that runner label is not available in your organization, change to:
+    # runs-on: windows-latest
     permissions:
       contents: read
       packages: write
@@ -51,6 +53,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
           & .\vcpkg\bootstrap-vcpkg.bat
+          # Expose VCPKG_ROOT for later steps
           Write-Host "vcpkg root: $PWD\vcpkg"
           Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
@@ -59,6 +62,9 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
+          # Install the (explicit) packages required by Dolphin in x64-windows triplet.
+          # Installing packages one-by-one avoids PowerShell passing the entire space-separated
+          # string as a single vcpkg package spec (the error you hit).
           $packages = @(
             'fmt',
             'sqlite3',
@@ -78,6 +84,8 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
           $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
+          # Use an explicit generator and architecture (Visual Studio generator + x64)
+          # and point CMake at the vcpkg toolchain file so dependencies are found.
           cmake -S Source -B build \
             -G "Visual Studio 17 2022" -A x64 \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
@@ -89,16 +97,18 @@ jobs:
       - name: Build (Release)
         shell: pwsh
         run: |
+          # Use --config Release to build Release configuration
           cmake --build build --config Release --target ALL_BUILD -- /m || (Write-Error "Build failed"; exit 1)
 
-      - id: package_and_zip
-        name: Collect artifacts and package
+      - name: Collect artifacts and package
         shell: pwsh
         run: |
           $out = "$PWD\artifacts"
           if (Test-Path $out) { Remove-Item -Recurse -Force $out }
           New-Item -ItemType Directory -Path $out | Out-Null
 
+          # Common places where the built exe/packaged files are produced by VS/CMake
+          # Adjust these patterns if your build produces outputs in a different location.
           $candidates = @(
             "$PWD\build\bin\Release\*",
             "$PWD\build\Release\*",
@@ -119,22 +129,20 @@ jobs:
             Copy-Item -Path "$PWD\build\*" -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+          # Ensure edited source files are included for traceability (optional)
           Copy-Item -Path "Source\Core\InputCommon\ControllerInterface\DualShockUDPClient\DualShockUDPClient.*" -Destination $out -ErrorAction SilentlyContinue
 
           $zipName = "dolphin-windows-${{ github.run_id }}.zip"
           if (Test-Path $zipName) { Remove-Item $zipName -Force }
           Compress-Archive -Path "$out\*" -DestinationPath $zipName -Force
           Write-Host "Packaged artifact: $zipName"
-
-          # Use the modern GITHUB_OUTPUT mechanism instead of ::set-output
-          # to expose the artifact filename as a step output for later steps.
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "artifact=$zipName"
+          Write-Output "::set-output name=artifact::$zipName"
 
       - name: Upload build artifact (actions artifact)
         uses: actions/upload-artifact@v4
         with:
           name: dolphin-windows-${{ github.run_id }}
-          path: ${{ steps.package_and_zip.outputs.artifact }}
+          path: dolphin-windows-${{ github.run_id }}.zip
 
       - name: Create GitHub release
         id: create_release
@@ -151,8 +159,8 @@ jobs:
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ steps.package_and_zip.outputs.artifact }}
-          asset_name: ${{ steps.package_and_zip.outputs.artifact }}
+          asset_path: dolphin-windows-${{ github.run_id }}.zip
+          asset_name: dolphin-windows-${{ github.run_id }}.zip
           asset_content_type: application/zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
