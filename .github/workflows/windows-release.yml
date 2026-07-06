@@ -39,33 +39,47 @@ jobs:
           & .\vcpkg\bootstrap-vcpkg.bat
           & .\vcpkg\vcpkg integrate install
 
-      - name: Install common dependencies via vcpkg (use explicit triplet)
+      - name: Install common dependencies via vcpkg (explicit triplet)
         shell: pwsh
         run: |
-          # Use an explicit triplet to avoid parsing issues; edit the package list to match Dolphin's deps if needed.
           .\vcpkg\vcpkg.exe install --triplet x64-windows fmt sqlite3 zlib libpng libjpeg-turbo glew
 
       - name: Configure & build (initialize MSVC env then use Ninja)
-        shell: cmd
+        shell: pwsh
         run: |
-          "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vswhere_out.txt 2>nul || echo
-          set /p VSINSTALLDIR=<vswhere_out.txt
-          if "%VSINSTALLDIR%"=="" (
-            echo Visual Studio not found via vswhere. Trying default BuildTools location...
-            if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools" (
-              set VSINSTALLDIR=%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools
-            )
+          # Find vswhere reliably
+          $vswherePaths = @(
+            Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe' 2>$null,
+            Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\Installer\vswhere.exe' 2>$null
           )
-          if "%VSINSTALLDIR%"=="" (
-            echo ERROR: Visual Studio installation not found. Exiting with failure.
-            exit /b 1
-          )
-          echo Using VS at "%VSINSTALLDIR%"
-          call "%VSINSTALLDIR%\VC\Auxiliary\Build\vcvars64.bat"
-          if exist build rd /s /q build
-          REM Use Ninja (no -A) — vcvars has placed cl.exe in PATH so Ninja + MSVC will work
-          cmake -S . -B build -G "Ninja" -DCMAKE_TOOLCHAIN_FILE="%CD%\vcpkg\scripts\buildsystems\vcpkg.cmake" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW
-          cmake --build build --config %BUILD_TYPE% -- /m
+          $vswhere = $vswherePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $vswhere) {
+            Write-Error "vswhere.exe not found under ProgramFiles(x86). Cannot locate Visual Studio. Ensure runner image has Build Tools / Visual Studio."
+            exit 1
+          }
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsInstall) {
+            # If vswhere returned nothing, fall back to BuildTools default path if present
+            $fallback = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools'
+            if (Test-Path $fallback) { $vsInstall = $fallback }
+          }
+          if (-not $vsInstall) {
+            Write-Error "Visual Studio installation not found (vswhere returned empty)."
+            exit 1
+          }
+          $vcvars = Join-Path $vsInstall 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) {
+            Write-Error "vcvars64.bat not found at $vcvars"
+            exit 1
+          }
+
+          # Build commands must run in the same cmd session where vcvars64 was called.
+          # Compose a single cmd.exe /c command to call vcvars64 and run cmake + build.
+          $cmakeToolchain = (Join-Path $PWD 'vcpkg\scripts\buildsystems\vcpkg.cmake').Replace('"','`"')
+          $vcvarsEscaped = $vcvars.Replace('"','`"')
+          $cmd = "call `"$vcvarsEscaped`" && if exist build rd /s /q build && cmake -S . -B build -G `"Ninja`" -DCMAKE_TOOLCHAIN_FILE=`"$cmakeToolchain`" -DCMAKE_CXX_STANDARD=17 -DDOLPHIN_BUILD_TESTS=OFF -DUNICODE=ON -Wdev -DCMAKE_POLICY_DEFAULT_CMP0074=NEW && cmake --build build --config $env:BUILD_TYPE -- /m"
+          Write-Host "Running build command in cmd.exe..."
+          cmd.exe /c $cmd
 
       - name: (Optional) Run tests if available
         if: success()
