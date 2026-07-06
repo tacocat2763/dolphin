@@ -1,7 +1,7 @@
 # Windows build + release workflow for tacocat2763/dolphin
 # - Builds Dolphin on Windows x64 using CMake + vcpkg
-# - Installs vcpkg packages one-by-one to avoid the PowerShell package-splitting bug
-# - Uses the vcpkg CMake toolchain file when configuring CMake
+# - Avoids the PowerShell/vcpkg package-splitting bug by installing packages one-by-one
+# - Uses vcpkg toolchain file when configuring CMake
 # - Creates a GitHub release and uploads the produced ZIP artifact
 # Trigger: push to master, push tags, or manual workflow_dispatch
 on:
@@ -15,22 +15,21 @@ concurrency:
   group: dolphin-windows-release
   cancel-in-progress: true
 
-# Give the GITHUB_TOKEN explicit rights to create releases / upload assets
-permissions:
-  contents: write
-  packages: write
-  actions: write
-
 env:
   BUILD_TYPE: Release
   VCPKG_TRIPLET: x64-windows
-  # Release tag: on master pushes use a SHA-based release tag; otherwise use a manual-run tag.
+  # Release tag uses master pushes or manual run id if not master
   RELEASE_TAG: ${{ github.ref == 'refs/heads/master' && format('release-{0}', github.sha) || format('manual-{0}', github.run_id) }}
 
 jobs:
   build-and-release-windows:
     name: Build and package (Windows x64)
     runs-on: windows-2025-vs2026
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+
     steps:
       - name: Checkout repository (including submodules)
         uses: actions/checkout@v4
@@ -39,7 +38,6 @@ jobs:
           fetch-depth: 1
 
       - name: Show edited files (DualShockUDPClient) for visibility
-        shell: pwsh
         run: |
           $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
           if (Test-Path $p) {
@@ -47,7 +45,6 @@ jobs:
           } else {
             Write-Host "Directory not found: $p"
           }
-          Write-Host "Ensure your two edited files are committed; the workflow builds whatever is checked in."
 
       - name: Clone vcpkg and bootstrap
         shell: pwsh
@@ -57,12 +54,11 @@ jobs:
           Write-Host "vcpkg root: $PWD\vcpkg"
           Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
-      - name: Install vcpkg packages (one-by-one)
+      - name: Install vcpkg packages (safe split per-package)
         shell: pwsh
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
-          # Install required packages one at a time to avoid PowerShell argument-splitting bugs.
           $packages = @(
             'fmt',
             'sqlite3',
@@ -73,57 +69,36 @@ jobs:
           )
           foreach ($p in $packages) {
             Write-Host "Installing vcpkg package: $p"
-            & .\vcpkg\vcpkg.exe install $p:$env:VCPKG_TRIPLET
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "vcpkg install failed for $p"
-              exit 1
-            }
+            & .\vcpkg\vcpkg.exe install --triplet $env:VCPKG_TRIPLET $p
           }
 
-      - name: Configure CMake (generate) with vcpkg toolchain (try VS then Ninja fallback)
+      - name: Configure CMake (generate)
         shell: pwsh
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
           $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
-          $cmakeArgs = @(
-            "-S", "Source",
-            "-B", "build",
-            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}",
-            "-DCMAKE_TOOLCHAIN_FILE=$cmakeToolchain",
-            "-DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }}",
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DDOLPHIN_ENABLE_TESTS=OFF"
-          )
-          Write-Host "Attempting configure with Visual Studio generator..."
-          cmake @cmakeArgs -G "Visual Studio 17 2022" -A x64
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Visual Studio generator failed; trying Ninja generator as a fallback."
-            cmake @cmakeArgs -G "Ninja" -A x64
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "CMake configure failed (both VS and Ninja generators)."
-              exit 1
-            }
-          }
+          cmake -S Source -B build \
+            -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" \
+            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DDOLPHIN_ENABLE_TESTS=OFF || (Write-Error "CMake configure failed"; exit 1)
 
       - name: Build (Release)
         shell: pwsh
         run: |
-          # Build Release configuration. For multi-config generators (VS), --config Release is required.
-          cmake --build build --config Release --target ALL_BUILD -- /m
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed"
-            exit 1
-          }
+          cmake --build build --config Release --target ALL_BUILD -- /m || (Write-Error "Build failed"; exit 1)
 
-      - name: Collect artifacts and package
+      - id: package_and_zip
+        name: Collect artifacts and package
         shell: pwsh
         run: |
           $out = "$PWD\artifacts"
           if (Test-Path $out) { Remove-Item -Recurse -Force $out }
           New-Item -ItemType Directory -Path $out | Out-Null
 
-          # Common candidate output paths (adjust if your build produces different layout)
           $candidates = @(
             "$PWD\build\bin\Release\*",
             "$PWD\build\Release\*",
@@ -133,7 +108,7 @@ jobs:
 
           $found = $false
           foreach ($pat in $candidates) {
-            if (Get-ChildItem -Path $pat -ErrorAction SilentlyContinue) {
+            if (Test-Path $pat) {
               Write-Host "Copying from $pat"
               Copy-Item -Path $pat -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
               $found = $true
@@ -144,7 +119,6 @@ jobs:
             Copy-Item -Path "$PWD\build\*" -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
           }
 
-          # Include the two edited DualShockUDPClient source files for traceability
           Copy-Item -Path "Source\Core\InputCommon\ControllerInterface\DualShockUDPClient\DualShockUDPClient.*" -Destination $out -ErrorAction SilentlyContinue
 
           $zipName = "dolphin-windows-${{ github.run_id }}.zip"
@@ -152,18 +126,15 @@ jobs:
           Compress-Archive -Path "$out\*" -DestinationPath $zipName -Force
           Write-Host "Packaged artifact: $zipName"
 
-          # Use the supported GITHUB_OUTPUT mechanism instead of deprecated ::set-output
-          if ($env:GITHUB_OUTPUT) {
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "artifact=$zipName"
-          } else {
-            Write-Host "GITHUB_OUTPUT is not set; artifact name: $zipName"
-          }
+          # Use the modern GITHUB_OUTPUT mechanism instead of ::set-output
+          # to expose the artifact filename as a step output for later steps.
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "artifact=$zipName"
 
       - name: Upload build artifact (actions artifact)
         uses: actions/upload-artifact@v4
         with:
           name: dolphin-windows-${{ github.run_id }}
-          path: dolphin-windows-${{ github.run_id }}.zip
+          path: ${{ steps.package_and_zip.outputs.artifact }}
 
       - name: Create GitHub release
         id: create_release
@@ -180,19 +151,18 @@ jobs:
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: dolphin-windows-${{ github.run_id }}.zip
-          asset_name: dolphin-windows-${{ github.run_id }}.zip
+          asset_path: ${{ steps.package_and_zip.outputs.artifact }}
+          asset_name: ${{ steps.package_and_zip.outputs.artifact }}
           asset_content_type: application/zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Final status
         if: always()
-        shell: pwsh
         run: |
           if ($LASTEXITCODE -ne 0) {
             Write-Host "One or more steps failed. Check the logs above for details."
             exit $LASTEXITCODE
           } else {
-            Write-Host "Workflow finished (success or partial success)."
+            Write-Host "Workflow finished successfully."
           }
