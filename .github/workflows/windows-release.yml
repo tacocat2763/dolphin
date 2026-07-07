@@ -71,7 +71,7 @@ jobs:
             'libpng',
             'libjpeg-turbo',
             'glew',
-            'qt6'
+            'qt'
           )
           foreach ($p in $packages) {
             Write-Host "Installing vcpkg package: $p"
