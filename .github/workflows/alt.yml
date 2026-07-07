@@ -1,4 +1,4 @@
-# Windows build + release workflow for tacocat2763/dolphin
+# Windows build + release workflow for tacocat2763/dolphin (OPTIMIZED ALT VERSION)
 # - Builds Dolphin on Windows x64 using CMake + vcpkg
 # - Avoids the PowerShell/vcpkg package-splitting bug by installing packages one-by-one
 # - Uses vcpkg toolchain file when configuring CMake
@@ -13,7 +13,7 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: dolphin-windows-release
+  group: dolphin-windows-release-alt
   cancel-in-progress: true
 
 env:
@@ -38,153 +38,5 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Show edited files (DualShockUDPClient) for visibility
-        run: |
-          $p = Join-Path $PWD 'Source\Core\InputCommon\ControllerInterface'
-          if (Test-Path $p) {
-            Get-ChildItem -Path $p -Filter 'DualShockUDPClient*' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
-          } else {
-            Write-Host "Directory not found: $p"
-          }
-
-      - name: Install Ninja
-        shell: pwsh
-        run: |
-          choco install ninja -y
-
-      - name: Clone vcpkg and bootstrap
-        shell: pwsh
-        run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          & .\vcpkg\bootstrap-vcpkg.bat
-          Write-Host "vcpkg root: $PWD\vcpkg"
-          Write-Host "CMake toolchain for vcpkg is: $PWD\vcpkg\scripts\buildsystems\vcpkg.cmake"
-
-      - name: Install vcpkg packages (safe split per-package)
-        shell: pwsh
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-        run: |
-          $packages = @(
-            'fmt',
-            'sqlite3',
-            'zlib',
-            'libpng',
-            'libjpeg-turbo',
-            'glew',
-            'qt'
-          )
-          foreach ($p in $packages) {
-            Write-Host "Installing vcpkg package: $p"
-            & .\vcpkg\vcpkg.exe install --triplet $env:VCPKG_TRIPLET $p
-          }
-
-      - name: Configure CMake (generate)
-        shell: pwsh
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
-        run: |
-          $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
-          $buildDir = Join-Path $PWD "build"
-
-          Write-Host "Using vcpkg toolchain: $cmakeToolchain"
-          Write-Host "Source: $PWD"
-          Write-Host "Build: $buildDir"
-
-          if (-not (Test-Path $buildDir)) {
-            New-Item -ItemType Directory -Path $buildDir | Out-Null
-          }
-
-          # Call cmake from the repository root, specifying build directory explicitly
-          & cmake `
-            -G "Ninja" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" `
-            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
-            -DBUILD_SHARED_LIBS=OFF `
-            -DDOLPHIN_ENABLE_TESTS=OFF `
-            -B "$buildDir" `
-            -S "."
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "CMake configure failed (exit code $LASTEXITCODE)"
-            exit $LASTEXITCODE
-          }
-
-      - name: Build (Release)
-        shell: pwsh
-        run: |
-          cmake --build build --config Release --target ALL_BUILD -- /m || (Write-Error "Build failed"; exit 1)
-
-      - name: Collect artifacts and package
-        shell: pwsh
-        run: |
-          $out = "$PWD\artifacts"
-          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
-          New-Item -ItemType Directory -Path $out | Out-Null
-
-          $candidates = @(
-            "$PWD\build\bin\Release\*",
-            "$PWD\build\Release\*",
-            "$PWD\build\bin\*",
-            "$PWD\build\*"
-          )
-
-          $found = $false
-          foreach ($pat in $candidates) {
-            if (Test-Path $pat) {
-              Write-Host "Copying from $pat"
-              Copy-Item -Path $pat -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
-              $found = $true
-            }
-          }
-          if (-not $found) {
-            Write-Host "No usual output folders found; packing the entire build tree as a fallback."
-            Copy-Item -Path "$PWD\build\*" -Destination $out -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
-          Copy-Item -Path "Source\Core\InputCommon\ControllerInterface\DualShockUDPClient\DualShockUDPClient.*" -Destination $out -ErrorAction SilentlyContinue
-
-          $zipName = "dolphin-windows-${{ github.run_id }}.zip"
-          if (Test-Path $zipName) { Remove-Item $zipName -Force }
-          Compress-Archive -Path "$out\*" -DestinationPath $zipName -Force
-          Write-Host "Packaged artifact: $zipName"
-          Write-Output "::set-output name=artifact::$zipName"
-
-      - name: Upload build artifact (actions artifact)
-        uses: actions/upload-artifact@v4
-        with:
-          name: dolphin-windows-${{ github.run_id }}
-          path: dolphin-windows-${{ github.run_id }}.zip
-
-      - name: Create GitHub release
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
-          body: "Automated Windows build (x64) from workflow run ${{ github.run_id }}."
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload release asset
-        id: upload_asset
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: dolphin-windows-${{ github.run_id }}.zip
-          asset_name: dolphin-windows-${{ github.run_id }}.zip
-          asset_content_type: application/zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Final status
-        if: always()
-        run: |
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "One or more steps failed. Check the logs above for details."
-            exit $LASTEXITCODE
-          } else {
-            Write-Host "Workflow finished successfully."
-          }
+      - name: Show edited files (](#)
+
