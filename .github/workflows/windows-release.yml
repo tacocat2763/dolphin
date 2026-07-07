@@ -46,6 +46,11 @@ jobs:
             Write-Host "Directory not found: $p"
           }
 
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          choco install ninja -y
+
       - name: Clone vcpkg and bootstrap
         shell: pwsh
         run: |
@@ -78,35 +83,31 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
         run: |
           $cmakeToolchain = Join-Path $env:VCPKG_ROOT "scripts\buildsystems\vcpkg.cmake"
-          $sourceDir = Join-Path $PWD "Source"
           $buildDir = Join-Path $PWD "build"
 
           Write-Host "Using vcpkg toolchain: $cmakeToolchain"
-          Write-Host "Source: $sourceDir"
+          Write-Host "Source: $PWD"
           Write-Host "Build: $buildDir"
 
           if (-not (Test-Path $buildDir)) {
             New-Item -ItemType Directory -Path $buildDir | Out-Null
           }
 
-          Push-Location $buildDir
-
-          # Call cmake from the build directory, explicitly invoke the toolchain and triplet.
+          # Call cmake from the repository root, specifying build directory explicitly
           & cmake `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$cmakeToolchain" `
             -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TRIPLET `
             -DBUILD_SHARED_LIBS=OFF `
             -DDOLPHIN_ENABLE_TESTS=OFF `
-            "$sourceDir"
+            -B "$buildDir" `
+            -S "."
 
           if ($LASTEXITCODE -ne 0) {
             Write-Error "CMake configure failed (exit code $LASTEXITCODE)"
             exit $LASTEXITCODE
           }
-
-          Pop-Location
 
       - name: Build (Release)
         shell: pwsh
